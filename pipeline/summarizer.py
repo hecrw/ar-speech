@@ -1,14 +1,5 @@
-"""Arabic text summarization pipeline.
+"""Arabic text summarization pipeline using Ollama LLM with mT5 fallback."""
 
-Primary backend: an Ollama-served LLM (aya-expanse:8b by default) accessed via
-its HTTP API. Aya is Cohere's multilingual model with excellent Arabic. This
-gives much higher-quality, more coherent summaries than a 580M-param seq2seq.
-
-Fallback: a local mT5_multilingual_XLSum (or our fine-tuned variant) if Ollama
-is unreachable, so the app still functions when the LLM server is down.
-"""
-
-import json
 import logging
 import re
 
@@ -35,15 +26,11 @@ SYSTEM_PROMPT = (
 
 
 class ArabicSummarizer:
-    """Arabic text summarizer using an Ollama LLM, with local seq2seq fallback."""
-
     def __init__(self, device: str | None = None):
         self.device = device or config.DEVICE
         self.ollama_url = config.OLLAMA_URL
         self.ollama_model = config.OLLAMA_SUMMARIZER_MODEL
-        self._fallback = None  # Lazily initialized mT5 fallback
-
-    # ── Backend selection ──────────────────────────────────────────────
+        self._fallback = None
 
     def _ollama_available(self) -> bool:
         try:
@@ -64,7 +51,6 @@ class ArabicSummarizer:
             return False
 
     def _ensure_fallback(self):
-        """Lazy-load the local mT5 fallback only if needed."""
         if self._fallback is not None:
             return
         logger.info("Loading mT5 fallback summarizer: %s", config.SUMMARIZER_FALLBACK_ID)
@@ -75,8 +61,6 @@ class ArabicSummarizer:
         mod = AutoModelForSeq2SeqLM.from_pretrained(config.SUMMARIZER_FALLBACK_ID)
         mod.to(self.device).eval()
         self._fallback = (tok, mod, torch)
-
-    # ── Public API ─────────────────────────────────────────────────────
 
     def summarize(self, text: str, max_length: int = config.MAX_SUMMARY_LENGTH) -> str:
         text = _clean(normalize_arabic(text))
@@ -95,7 +79,6 @@ class ArabicSummarizer:
         if not segments:
             return {"overall_summary": "", "section_summaries": []}
 
-        # Group segments into ~5-chunk sections
         section_size = 5
         sections = []
         for i in range(0, len(segments), section_size):
@@ -119,8 +102,6 @@ class ArabicSummarizer:
 
         return {"overall_summary": overall, "section_summaries": section_summaries}
 
-    # ── Backends ───────────────────────────────────────────────────────
-
     def _summarize_ollama(self, text: str, max_length: int) -> str:
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
@@ -135,7 +116,7 @@ class ArabicSummarizer:
                 "stream": False,
                 "options": {
                     "temperature": 0.3,
-                    "num_predict": max_length * 2,  # tokens, generous
+                    "num_predict": max_length * 2,
                     "stop": ["النص:", "\n\n\n"],
                 },
             },
@@ -143,7 +124,6 @@ class ArabicSummarizer:
         )
         r.raise_for_status()
         out = r.json()["response"].strip()
-        # Trim any echoed prompt or label
         for prefix in ("الملخص:", "الملخص :", "الملخّص:"):
             if out.startswith(prefix):
                 out = out[len(prefix):].strip()
@@ -153,7 +133,6 @@ class ArabicSummarizer:
         self._ensure_fallback()
         tok, mod, torch = self._fallback
 
-        # Hierarchical for long inputs
         token_count = len(tok.encode(text, add_special_tokens=False))
         if token_count > config.MAX_INPUT_LENGTH:
             words = text.split()

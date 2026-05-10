@@ -1,16 +1,4 @@
-"""Keyword spotting over an ASR transcript.
-
-Two flavors:
-  1) Exact / substring keyword matching with timestamps from Whisper segments.
-     Fast, deterministic, useful for known-vocabulary alerts ("emergency",
-     "deadline", "exam") which is exactly what the project brief calls for.
-
-  2) Semantic keyword matching: each segment is embedded; keywords are
-     embedded as queries; a match is reported if cosine similarity exceeds
-     a threshold. Catches paraphrases (e.g. "اجتماع طارئ" matches "emergency").
-
-The Gradio app exposes both — exact for precision, semantic for recall.
-"""
+"""Keyword spotting over an ASR transcript."""
 
 import logging
 import re
@@ -32,15 +20,6 @@ def find_keywords_exact(
     segments: list[dict],
     keywords: list[str],
 ) -> list[dict]:
-    """Find exact (substring) keyword occurrences in each segment.
-
-    Args:
-        segments: list of {start, end, text} from ArabicASR.transcribe.
-        keywords: list of keyword strings (Arabic or English).
-
-    Returns:
-        list of hits: [{keyword, segment_text, start, end, count}, ...]
-    """
     hits = []
     for kw_raw in keywords:
         kw = normalize_arabic(kw_raw).strip()
@@ -67,18 +46,6 @@ def find_keywords_semantic(
     threshold: float = 0.55,
     top_k_per_keyword: int = 3,
 ) -> list[dict]:
-    """Find semantically similar segments to each keyword via cosine similarity.
-
-    Args:
-        segments: list of {start, end, text}.
-        keywords: list of keyword/phrase strings.
-        embedder: an ArabicEmbedder instance (used for both segments & queries).
-        threshold: minimum cosine similarity to count as a hit.
-        top_k_per_keyword: cap on hits per keyword.
-
-    Returns:
-        list of hits sorted by score descending, with the original segment text.
-    """
     if not segments or not keywords:
         return []
 
@@ -90,7 +57,6 @@ def find_keywords_semantic(
         if not kw.strip():
             continue
         q = embedder.embed_query(kw)
-        # Both are L2-normalized → dot product is cosine similarity
         sims = seg_embeddings @ q
         order = np.argsort(-sims)
         for idx in order[:top_k_per_keyword]:
@@ -110,7 +76,6 @@ def find_keywords_semantic(
 
 
 def parse_keyword_input(text: str) -> list[str]:
-    """User types comma- or newline-separated keywords; we split & strip."""
     if not text:
         return []
     parts = re.split(r"[,\n]+", text)
@@ -118,6 +83,5 @@ def parse_keyword_input(text: str) -> list[str]:
 
 
 def format_timestamp(seconds: float) -> str:
-    """Pretty mm:ss formatter."""
     seconds = int(round(seconds))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"

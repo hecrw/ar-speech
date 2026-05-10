@@ -1,13 +1,4 @@
-"""Emotion / sentiment detection on the Arabic transcript.
-
-Approach: text-based sentiment classification using CAMeL-Lab's Arabic BERT,
-which has been fine-tuned on Arabic sentiment data. Outputs probabilities for
-{positive, negative, neutral}, which we map onto a coarse emotion label.
-
-This is more reliable for Arabic than acoustic SER models — the publicly
-available Arabic SER checkpoints are scarce and unstable, while Arabic text
-sentiment is well-supported.
-"""
+"""Emotion / sentiment detection on the Arabic transcript."""
 
 import logging
 import torch
@@ -18,17 +9,14 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# Map sentiment labels → human-friendly emotion bucket + emoji
 LABEL_TO_EMOTION = {
-    "positive": ("Positive", "😊"),
-    "negative": ("Negative", "😠"),
-    "neutral":  ("Neutral",  "😐"),
+    "positive": "Positive",
+    "negative": "Negative",
+    "neutral":  "Neutral",
 }
 
 
 class ArabicEmotionDetector:
-    """Sentiment / emotion classifier over Arabic text."""
-
     def __init__(self, device: str | None = None):
         self.device = device or config.DEVICE
         self.tokenizer = None
@@ -49,12 +37,10 @@ class ArabicEmotionDetector:
             self._load()
 
     def detect(self, text: str) -> dict:
-        """Classify a single piece of text. Returns label, emoji, scores."""
         self._ensure_loaded()
         if not text or not text.strip():
-            return {"label": "Neutral", "emoji": "😐", "scores": {}}
+            return {"label": "Neutral", "scores": {}}
 
-        # CAMeL BERT max length 512
         inputs = self.tokenizer(
             text, return_tensors="pt", truncation=True, max_length=512,
         ).to(self.device)
@@ -67,17 +53,15 @@ class ArabicEmotionDetector:
         scores = {id2label[i].lower(): probs[i] for i in range(len(probs))}
 
         top_label_raw = max(scores, key=scores.get)
-        label, emoji = LABEL_TO_EMOTION.get(top_label_raw, (top_label_raw.title(), "❓"))
+        label = LABEL_TO_EMOTION.get(top_label_raw, top_label_raw.title())
 
         return {
             "label": label,
-            "emoji": emoji,
             "confidence": scores[top_label_raw],
             "scores": scores,
         }
 
     def detect_segments(self, segments: list[dict]) -> list[dict]:
-        """Classify each ASR segment individually for a per-segment timeline."""
         return [
             {**seg, "emotion": self.detect(seg["text"])}
             for seg in segments

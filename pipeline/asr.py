@@ -43,9 +43,6 @@ class ArabicASR:
         self.processor = WhisperProcessor.from_pretrained(
             config.WHISPER_MODEL_ID, language="Arabic", task="transcribe"
         )
-        # Force fp32 — turbo's checkpoint is saved as fp16 on HF, and recent
-        # transformers respects that; loading in fp32 keeps inference robust
-        # across devices (mps/cuda/cpu).
         self.model = WhisperForConditionalGeneration.from_pretrained(
             config.WHISPER_MODEL_ID,
             torch_dtype=torch.float32,
@@ -173,7 +170,6 @@ class ArabicASR:
 
         result = self.processor.batch_decode(output, skip_special_tokens=True, output_offsets=True)
 
-        # Fall back to chunk-based segments if offset decoding is unavailable
         if isinstance(result, list) and len(result) > 0 and isinstance(result[0], str):
             return self.transcribe(audio_path)["segments"]
 
