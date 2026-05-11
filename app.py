@@ -1,7 +1,4 @@
-"""Gradio demo for the Arabic Audio Understanding system.
-
-Pipeline: Speech -> Transcript -> Summary + Emotion + Keywords
-"""
+"""Gradio demo for the Arabic Audio Understanding system."""
 
 import logging
 import sys
@@ -19,7 +16,6 @@ from pipeline.summarizer import ArabicSummarizer
 from pipeline.embedder import ArabicEmbedder
 from pipeline.emotion import ArabicEmotionDetector
 from pipeline import keywords as kw
-from pipeline import history
 from utils.audio import validate_audio
 from utils.text import clean_transcript
 
@@ -69,22 +65,34 @@ def get_emotion() -> ArabicEmotionDetector:
 _LAST_SEGMENTS: list[dict] = []
 
 
+KEYWORD_COLS = ["Match Type", "Keyword", "Time", "Count", "Score", "Segment"]
+SEARCH_COLS = ["Score", "Time", "Segment"]
+
+
+def _empty_keywords_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=KEYWORD_COLS)
+
+
+def _empty_search_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=SEARCH_COLS)
+
+
 def process_audio(audio_path: str, keyword_input: str) -> tuple:
     global _LAST_SEGMENTS
 
     if audio_path is None:
-        return "", "", "", pd.DataFrame(), "Please upload an audio file."
+        return "", "", "", _empty_keywords_df(), "Please upload an audio file."
 
     is_valid, msg = validate_audio(audio_path)
     if not is_valid:
-        return "", "", "", pd.DataFrame(), f"Invalid audio: {msg}"
+        return "", "", "", _empty_keywords_df(), f"Invalid audio: {msg}"
 
     try:
         asr = get_asr("whisper")
         result = asr.transcribe(audio_path)
         transcript = clean_transcript(result["text"])
         if not transcript.strip():
-            return "", "", "", pd.DataFrame(), "No speech detected in the audio."
+            return "", "", "", _empty_keywords_df(), "No speech detected in the audio."
 
         _LAST_SEGMENTS = result["segments"]
 
@@ -95,40 +103,30 @@ def process_audio(audio_path: str, keyword_input: str) -> tuple:
         emotion = emotion_detector.detect(transcript)
         emotion_html = _format_emotion(emotion)
 
-        keyword_df = pd.DataFrame()
+        keyword_df = _empty_keywords_df()
         keyword_list = kw.parse_keyword_input(keyword_input)
         if keyword_list:
             keyword_df = _run_keyword_spotting(result["segments"], keyword_list)
-
-        history.add_entry(
-            audio_filename=Path(audio_path).name,
-            duration_sec=result["duration_sec"],
-            transcript=transcript,
-            summary=summary,
-            emotion=emotion,
-            segments=result["segments"],
-        )
 
         backend = "Ollama LLM" if summarizer._ollama_available() else "mT5 (fallback)"
         status = (
             f"Transcribed {result['duration_sec']:.1f}s with Whisper. "
             f"Summarized via {backend}. "
-            f"Sentiment: {emotion['label']} ({emotion['confidence']:.0%}). "
-            f"Saved to history."
+            f"Sentiment: {emotion['label']} ({emotion['confidence']:.0%})."
         )
         return transcript, summary, emotion_html, keyword_df, status
 
     except Exception as e:
         logger.exception("Pipeline error")
-        return "", "", "", pd.DataFrame(), f"Error: {e}"
+        return "", "", "", _empty_keywords_df(), f"Error: {e}"
 
 
 def rerun_keywords(keyword_input: str) -> pd.DataFrame:
     if not _LAST_SEGMENTS:
-        return pd.DataFrame({"info": ["Run the Full Pipeline on an audio file first."]})
+        return _empty_keywords_df()
     keyword_list = kw.parse_keyword_input(keyword_input)
     if not keyword_list:
-        return pd.DataFrame()
+        return _empty_keywords_df()
     return _run_keyword_spotting(_LAST_SEGMENTS, keyword_list)
 
 
@@ -143,14 +141,14 @@ def _run_keyword_spotting(segments: list[dict], keyword_list: list[str]) -> pd.D
             "Match Type": "Exact",
             "Keyword": h["keyword"],
             "Time": f"{kw.format_timestamp(h['start'])} - {kw.format_timestamp(h['end'])}",
-            "Count": h["count"],
+            "Count": str(h["count"]),
             "Score": "1.000",
             "Segment": h["segment_text"],
         })
-    seen_segments = {(h["keyword"], h["start"]) for h in exact}
+    seen = {(h["keyword"], h["start"]) for h in exact}
     for h in semantic:
         key = (h["keyword"], h["start"])
-        if key in seen_segments:
+        if key in seen:
             continue
         rows.append({
             "Match Type": "Semantic",
@@ -162,8 +160,8 @@ def _run_keyword_spotting(segments: list[dict], keyword_list: list[str]) -> pd.D
         })
 
     if not rows:
-        return pd.DataFrame({"info": [f"No matches found for: {', '.join(keyword_list)}"]})
-    return pd.DataFrame(rows)
+        return _empty_keywords_df()
+    return pd.DataFrame(rows, columns=KEYWORD_COLS)
 
 
 def _format_emotion(emotion: dict) -> str:
@@ -188,75 +186,36 @@ def _format_emotion(emotion: dict) -> str:
     )
 
 
-def search_transcript(query: str, top_k: int = 5) -> pd.DataFrame:
+def search_transcript(query: str, top_k: int = 5) -> tuple[str, pd.DataFrame]:
     if not _LAST_SEGMENTS:
-        return pd.DataFrame({"info": ["Process an audio file first."]})
-    if not query.strip():
-        return pd.DataFrame(columns=["Score", "Time", "Segment"])
+        return "Process an audio file first.", _empty_search_df()
+    if not query or not query.strip():
+        return "Type a query.", _empty_search_df()
 
-    embedder = get_embedder()
-    seg_texts = [s["text"] for s in _LAST_SEGMENTS]
-    seg_embeddings = embedder.embed_documents(seg_texts, show_progress=False)
-    q = embedder.embed_query(query)
-    sims = seg_embeddings @ q
-    order = np.argsort(-sims)[: int(top_k)]
+    try:
+        embedder = get_embedder()
+        seg_texts = [s["text"] for s in _LAST_SEGMENTS]
+        seg_embeddings = embedder.embed_documents(seg_texts, show_progress=False)
+        q = embedder.embed_query(query)
+        sims = seg_embeddings @ q
+        order = np.argsort(-sims)[: int(top_k)]
 
-    rows = []
-    for idx in order:
-        seg = _LAST_SEGMENTS[int(idx)]
-        rows.append({
-            "Score": f"{float(sims[idx]):.3f}",
-            "Time": f"{kw.format_timestamp(seg['start'])} - {kw.format_timestamp(seg['end'])}",
-            "Segment": seg["text"],
-        })
-    return pd.DataFrame(rows)
+        rows = []
+        for idx in order:
+            seg = _LAST_SEGMENTS[int(idx)]
+            rows.append({
+                "Score": f"{float(sims[idx]):.3f}",
+                "Time": f"{kw.format_timestamp(seg['start'])} - {kw.format_timestamp(seg['end'])}",
+                "Segment": seg["text"],
+            })
 
+        df = pd.DataFrame(rows, columns=SEARCH_COLS) if rows else _empty_search_df()
+        status = f"Found top {len(rows)} segments for: {query}"
+        return status, df
 
-def refresh_history() -> pd.DataFrame:
-    entries = history.load_history()
-    if not entries:
-        return pd.DataFrame({"info": ["No history yet. Process some audio first."]})
-
-    rows = []
-    for e in entries:
-        summary_preview = e["summary"][:120] + ("..." if len(e["summary"]) > 120 else "")
-        rows.append({
-            "Time": e["timestamp"].replace("T", " "),
-            "Audio": e["audio_file"],
-            "Duration": f"{e['duration_sec']:.1f}s",
-            "Sentiment": f"{e['emotion_label']} ({e['emotion_confidence']:.0%})",
-            "Summary": summary_preview,
-        })
-    return pd.DataFrame(rows)
-
-
-def load_history_entry(evt: gr.SelectData) -> tuple:
-    entries = history.load_history()
-    if not entries or evt.index is None:
-        return "", "", "", ""
-    row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-    if row_idx >= len(entries):
-        return "", "", "", ""
-    entry = entries[row_idx]
-
-    global _LAST_SEGMENTS
-    _LAST_SEGMENTS = entry.get("segments", [])
-
-    meta = (
-        f"**Audio:** {entry['audio_file']} • "
-        f"**Duration:** {entry['duration_sec']:.1f}s • "
-        f"**Time:** {entry['timestamp'].replace('T', ' ')} • "
-        f"**Sentiment:** {entry['emotion_label']} ({entry['emotion_confidence']:.0%})"
-    )
-    return meta, entry["transcript"], entry["summary"], (
-        f"Loaded entry from {entry['timestamp']}. "
-        f"You can now run Keyword Spotting or Search Transcript on this session."
-    )
-
-
-def clear_all_history() -> tuple[pd.DataFrame, str]:
-    history.clear_history()
-    return refresh_history(), "History cleared."
+    except Exception as e:
+        logger.exception("Search failed")
+        return f"Search error: {e}", _empty_search_df()
 
 
 def compare_asr(audio_path: str) -> tuple[str, str]:
@@ -333,8 +292,10 @@ def build_app() -> gr.Blocks:
 
             gr.Markdown("### Keyword Hits (with timestamps)")
             keyword_output = gr.Dataframe(
-                headers=["Match Type", "Keyword", "Time", "Count", "Score", "Segment"],
+                headers=KEYWORD_COLS,
+                value=_empty_keywords_df(),
                 wrap=True,
+                interactive=False,
             )
             rerun_kw_btn = gr.Button("Re-run keyword search on last audio")
 
@@ -352,8 +313,8 @@ def build_app() -> gr.Blocks:
 
             gr.Markdown("### Search Inside Transcript")
             gr.Markdown(
-                "Ask a natural-language question. The embedder finds the most "
-                "relevant segments from the **last processed audio**."
+                "Type an Arabic query. The embedder ranks segments from the "
+                "**last processed audio** by semantic similarity."
             )
             with gr.Row():
                 query_box = gr.Textbox(
@@ -364,45 +325,18 @@ def build_app() -> gr.Blocks:
                 )
                 query_top_k = gr.Slider(1, 10, value=5, step=1, label="Top-K", scale=1)
             query_btn = gr.Button("Search Transcript", variant="primary")
+            query_status = gr.Textbox(label="Search Status", interactive=False)
             query_results = gr.Dataframe(
-                headers=["Score", "Time", "Segment"],
-                wrap=True,
-            )
-            query_btn.click(search_transcript, [query_box, query_top_k], [query_results])
-
-        with gr.Tab("History"):
-            gr.Markdown(
-                "Past sessions are saved to `data/history.json` (last 50 kept). "
-                "**Click a row** to load that session — its transcript becomes the "
-                "active one for keyword spotting and transcript search."
-            )
-            with gr.Row():
-                refresh_btn = gr.Button("Refresh", variant="primary")
-                clear_btn = gr.Button("Clear History", variant="stop")
-            history_status = gr.Textbox(label="Status", interactive=False)
-            history_table = gr.Dataframe(
-                headers=["Time", "Audio", "Duration", "Sentiment", "Summary"],
+                headers=SEARCH_COLS,
+                value=_empty_search_df(),
                 wrap=True,
                 interactive=False,
             )
-
-            gr.Markdown("### Loaded Session Detail")
-            history_meta = gr.Markdown()
-            with gr.Row():
-                history_transcript = gr.Textbox(
-                    label="Transcript", lines=12, rtl=True, interactive=False,
-                )
-                history_summary = gr.Textbox(
-                    label="Summary", lines=12, rtl=True, interactive=False,
-                )
-
-            refresh_btn.click(refresh_history, [], [history_table])
-            clear_btn.click(clear_all_history, [], [history_table, history_status])
-            history_table.select(
-                load_history_entry,
-                outputs=[history_meta, history_transcript, history_summary, history_status],
+            query_btn.click(
+                fn=search_transcript,
+                inputs=[query_box, query_top_k],
+                outputs=[query_status, query_results],
             )
-            demo.load(refresh_history, [], [history_table])
 
         with gr.Tab("ASR Comparison"):
             gr.Markdown("Compare **fine-tuned Whisper** vs **Wav2Vec2 XLSR-53 Arabic**.")
