@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import gradio as gr
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -18,6 +19,7 @@ from pipeline.summarizer import ArabicSummarizer
 from pipeline.embedder import ArabicEmbedder
 from pipeline.emotion import ArabicEmotionDetector
 from pipeline import keywords as kw
+from pipeline import history
 from utils.audio import validate_audio
 from utils.text import clean_transcript
 
@@ -98,11 +100,21 @@ def process_audio(audio_path: str, keyword_input: str) -> tuple:
         if keyword_list:
             keyword_df = _run_keyword_spotting(result["segments"], keyword_list)
 
+        history.add_entry(
+            audio_filename=Path(audio_path).name,
+            duration_sec=result["duration_sec"],
+            transcript=transcript,
+            summary=summary,
+            emotion=emotion,
+            segments=result["segments"],
+        )
+
         backend = "Ollama LLM" if summarizer._ollama_available() else "mT5 (fallback)"
         status = (
             f"Transcribed {result['duration_sec']:.1f}s with Whisper. "
             f"Summarized via {backend}. "
-            f"Sentiment: {emotion['label']} ({emotion['confidence']:.0%})."
+            f"Sentiment: {emotion['label']} ({emotion['confidence']:.0%}). "
+            f"Saved to history."
         )
         return transcript, summary, emotion_html, keyword_df, status
 
@@ -174,6 +186,77 @@ def _format_emotion(emotion: dict) -> str:
         f"Confidence: {emotion['confidence']:.0%}</div>"
         f"{table}</div>"
     )
+
+
+def search_transcript(query: str, top_k: int = 5) -> pd.DataFrame:
+    if not _LAST_SEGMENTS:
+        return pd.DataFrame({"info": ["Process an audio file first."]})
+    if not query.strip():
+        return pd.DataFrame(columns=["Score", "Time", "Segment"])
+
+    embedder = get_embedder()
+    seg_texts = [s["text"] for s in _LAST_SEGMENTS]
+    seg_embeddings = embedder.embed_documents(seg_texts, show_progress=False)
+    q = embedder.embed_query(query)
+    sims = seg_embeddings @ q
+    order = np.argsort(-sims)[: int(top_k)]
+
+    rows = []
+    for idx in order:
+        seg = _LAST_SEGMENTS[int(idx)]
+        rows.append({
+            "Score": f"{float(sims[idx]):.3f}",
+            "Time": f"{kw.format_timestamp(seg['start'])} - {kw.format_timestamp(seg['end'])}",
+            "Segment": seg["text"],
+        })
+    return pd.DataFrame(rows)
+
+
+def refresh_history() -> pd.DataFrame:
+    entries = history.load_history()
+    if not entries:
+        return pd.DataFrame({"info": ["No history yet. Process some audio first."]})
+
+    rows = []
+    for e in entries:
+        summary_preview = e["summary"][:120] + ("..." if len(e["summary"]) > 120 else "")
+        rows.append({
+            "Time": e["timestamp"].replace("T", " "),
+            "Audio": e["audio_file"],
+            "Duration": f"{e['duration_sec']:.1f}s",
+            "Sentiment": f"{e['emotion_label']} ({e['emotion_confidence']:.0%})",
+            "Summary": summary_preview,
+        })
+    return pd.DataFrame(rows)
+
+
+def load_history_entry(evt: gr.SelectData) -> tuple:
+    entries = history.load_history()
+    if not entries or evt.index is None:
+        return "", "", "", ""
+    row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if row_idx >= len(entries):
+        return "", "", "", ""
+    entry = entries[row_idx]
+
+    global _LAST_SEGMENTS
+    _LAST_SEGMENTS = entry.get("segments", [])
+
+    meta = (
+        f"**Audio:** {entry['audio_file']} • "
+        f"**Duration:** {entry['duration_sec']:.1f}s • "
+        f"**Time:** {entry['timestamp'].replace('T', ' ')} • "
+        f"**Sentiment:** {entry['emotion_label']} ({entry['emotion_confidence']:.0%})"
+    )
+    return meta, entry["transcript"], entry["summary"], (
+        f"Loaded entry from {entry['timestamp']}. "
+        f"You can now run Keyword Spotting or Search Transcript on this session."
+    )
+
+
+def clear_all_history() -> tuple[pd.DataFrame, str]:
+    history.clear_history()
+    return refresh_history(), "History cleared."
 
 
 def compare_asr(audio_path: str) -> tuple[str, str]:
@@ -266,6 +349,60 @@ def build_app() -> gr.Blocks:
                 inputs=[keyword_box],
                 outputs=[keyword_output],
             )
+
+            gr.Markdown("### Search Inside Transcript")
+            gr.Markdown(
+                "Ask a natural-language question. The embedder finds the most "
+                "relevant segments from the **last processed audio**."
+            )
+            with gr.Row():
+                query_box = gr.Textbox(
+                    label="Query (Arabic)",
+                    placeholder="ابحث في النص...",
+                    rtl=True,
+                    scale=3,
+                )
+                query_top_k = gr.Slider(1, 10, value=5, step=1, label="Top-K", scale=1)
+            query_btn = gr.Button("Search Transcript", variant="primary")
+            query_results = gr.Dataframe(
+                headers=["Score", "Time", "Segment"],
+                wrap=True,
+            )
+            query_btn.click(search_transcript, [query_box, query_top_k], [query_results])
+
+        with gr.Tab("History"):
+            gr.Markdown(
+                "Past sessions are saved to `data/history.json` (last 50 kept). "
+                "**Click a row** to load that session — its transcript becomes the "
+                "active one for keyword spotting and transcript search."
+            )
+            with gr.Row():
+                refresh_btn = gr.Button("Refresh", variant="primary")
+                clear_btn = gr.Button("Clear History", variant="stop")
+            history_status = gr.Textbox(label="Status", interactive=False)
+            history_table = gr.Dataframe(
+                headers=["Time", "Audio", "Duration", "Sentiment", "Summary"],
+                wrap=True,
+                interactive=False,
+            )
+
+            gr.Markdown("### Loaded Session Detail")
+            history_meta = gr.Markdown()
+            with gr.Row():
+                history_transcript = gr.Textbox(
+                    label="Transcript", lines=12, rtl=True, interactive=False,
+                )
+                history_summary = gr.Textbox(
+                    label="Summary", lines=12, rtl=True, interactive=False,
+                )
+
+            refresh_btn.click(refresh_history, [], [history_table])
+            clear_btn.click(clear_all_history, [], [history_table, history_status])
+            history_table.select(
+                load_history_entry,
+                outputs=[history_meta, history_transcript, history_summary, history_status],
+            )
+            demo.load(refresh_history, [], [history_table])
 
         with gr.Tab("ASR Comparison"):
             gr.Markdown("Compare **fine-tuned Whisper** vs **Wav2Vec2 XLSR-53 Arabic**.")
